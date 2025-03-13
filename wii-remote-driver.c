@@ -10,7 +10,6 @@
  * a battery/status update, and the corresponding battery level (report ID 0x20) is also
  * written into the buffer. A /proc entry is created to report driver state.
  *
- * Adjust HID device IDs, report IDs, and bit masks as necessary.
  */
 
 #include <linux/module.h>
