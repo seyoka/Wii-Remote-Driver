@@ -1,192 +1,381 @@
-#include <linux/module.h>
-#include <linux/hid.h>
-#include <linux/input.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-
-/* Nintendo Wii Remote vendor/product IDs.
- * Officially: Vendor = 0x057E, Product = 0x0306.
+/*
+ * wii_remote_driver.c - A character/HID driver for a Wii Remote.
+ *
+ * This driver registers as a HID driver to capture raw reports from the Wii remote.
+ * It performs basic input mapping (using button bit masks from your older working code)
+ * and writes human-readable results to a circular buffer. The circular buffer is then
+ * exposed via a character device (/dev/wii_remote) for user-space consumption.
+ *
+ * Additionally, an ioctl command triggers an output report (command 0x15) to request
+ * a battery/status update, and the corresponding battery level (report ID 0x20) is also
+ * written into the buffer. A /proc entry is created to report driver state.
+ *
+ * Adjust HID device IDs, report IDs, and bit masks as necessary.
  */
-#define WIIMOTE_VENDOR_ID  0x057E  
-#define WIIMOTE_PRODUCT_ID 0x0306
 
-/* Our custom driver data structure */
-struct wii_data {
-    struct input_dev *input;
-};
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/mutex.h>
+#include <linux/uaccess.h>
+#include <linux/hid.h>
+#include <linux/string.h>
+#include <linux/ioctl.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
+#define DRIVER_NAME "wii_remote_driver"
+#define DEVICE_NAME "wii_remote"
+#define CIRC_BUFFER_SIZE 1024
+
+/* IOCTL command to request a battery/status update */
+#define WIIMOTE_IOCTL_REQUEST_STATUS _IO('W', 1)
+
+/*  circular buffer for mapped output */
+static char circ_buffer[CIRC_BUFFER_SIZE];
+static int head = 0, tail = 0;
+static DEFINE_MUTEX(circ_mutex);
+
+/* pointer to the HID device instance */
+static struct hid_device *wii_hid_dev = NULL;
+
+
+static int wii_connected = 0;     /* 1 if connected, 0 if not */
+static int wii_last_battery = -1; /* -1 means unknown */
+static struct proc_dir_entry *wii_proc_entry;
+
+
+static void circ_buffer_write(const char *data, size_t len)
+{
+    size_t i;
+    mutex_lock(&circ_mutex);
+    for (i = 0; i < len; i++) {
+        int next = (head + 1) % CIRC_BUFFER_SIZE;
+        if (next == tail) {
+            printk(KERN_WARNING DRIVER_NAME ": circular buffer full, dropping data\n");
+            break;
+        }
+        circ_buffer[head] = data[i];
+        head = next;
+    }
+    mutex_unlock(&circ_mutex);
+}
 
 /*
- * Custom raw_event callback.
- * This function is called whenever a new HID report is received.
+ * perform_input_mapping - this parses a button report and write a human-readable string
+ * into the circular buffer.
+ *
+ * :
+ *   Byte 0: Report ID.
+ *   Byte 1: D-pad and special buttons:
+ *            Bit 0: D-pad Right
+ *            Bit 1: D-pad Left
+ *            Bit 2: D-pad Down
+ *            Bit 3: D-pad Up
+ *            Bit 4: Plus Button
+ *            Bit 5: Minus Button
+ *            Bit 6: Home Button
+ *   Byte 2: Action buttons:
+ *            Bit 0: A Button
+ *            Bit 1: B Button
+ *            Bit 2: Button 1
+ *            Bit 3: Button 2
  */
-static int wii_parse_report(struct hid_device *hdev, struct hid_report *report,
-                            u8 *data, int size)
+static void perform_input_mapping(const u8 *data, int size)
 {
-    struct wii_data *wii = hid_get_drvdata(hdev);
-    struct input_dev *in_dev = wii->input;
+    char mapping_output[256];
+    int len = 0;
 
-    /* Expect at least 3 bytes:
-     * data[0]: Report ID
-     * data[1]: First byte of button data
-     * data[2]: Second byte of button data
-     */
-    if (size < 3)
-        return 0;
-    
+    if (size < 3) {
+        printk(KERN_WARNING DRIVER_NAME ": Report too short for mapping\n");
+        return;
+    }
+
     u8 report_id = data[0];
     u8 btn_byte1 = data[1];
     u8 btn_byte2 = data[2];
 
-    /*
-     * Mapping for the first byte (btn_byte1):
-     * Bit 0: D-pad Right
-     * Bit 1: D-pad Left
-     * Bit 2: D-pad Down
-     * Bit 3: D-pad Up
-     * Bit 4: Plus Button
-     * Bit 5: Minus Button
-     * Bit 6: Home Button
-     */
-    bool dpad_right = btn_byte1 & 0x01;
-    bool dpad_left  = btn_byte1 & 0x02;
-    bool dpad_down  = btn_byte1 & 0x04;
-    bool dpad_up    = btn_byte1 & 0x08;
-    bool btn_plus   = btn_byte1 & 0x10;
-    bool btn_minus  = btn_byte1 & 0x20;
-    bool btn_home   = btn_byte1 & 0x40;
+    len += snprintf(mapping_output + len, sizeof(mapping_output) - len,
+                    "Report: ID=%u, ", report_id);
 
-    /*
-     * Mapping for the second byte (btn_byte2):
-     * Bit 0: A Button
-     * Bit 1: B Button
-     * Bit 2: Button 1
-     * Bit 3: Button 2
-     */
-    bool btn_A = btn_byte2 & 0x01;
-    bool btn_B = btn_byte2 & 0x02;
-    bool btn_1 = btn_byte2 & 0x04;
-    bool btn_2 = btn_byte2 & 0x08;
+    if (btn_byte1 & 0x01)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Dpad_Right ");
+    if (btn_byte1 & 0x02)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Dpad_Left ");
+    if (btn_byte1 & 0x04)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Dpad_Down ");
+    if (btn_byte1 & 0x08)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Dpad_Up ");
+    if (btn_byte1 & 0x10)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Plus ");
+    if (btn_byte1 & 0x20)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Minus ");
+    if (btn_byte1 & 0x40)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "Home ");
 
-    printk(KERN_INFO "Wii Remote Report: ID=%u, dpad(R:%d L:%d U:%d D:%d), plus=%d, minus=%d, home=%d, A=%d, B=%d, 1=%d, 2=%d\n",
-           report_id, dpad_right, dpad_left, dpad_up, dpad_down,
-           btn_plus, btn_minus, btn_home, btn_A, btn_B, btn_1, btn_2);
+    if (btn_byte2 & 0x01)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "A ");
+    if (btn_byte2 & 0x02)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "B ");
+    if (btn_byte2 & 0x04)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "1 ");
+    if (btn_byte2 & 0x08)
+        len += snprintf(mapping_output + len, sizeof(mapping_output) - len, "2 ");
 
-    /* Report these events via our allocated input device */
-    input_report_key(in_dev, KEY_RIGHT, dpad_right);
-    input_report_key(in_dev, KEY_LEFT,  dpad_left);
-    input_report_key(in_dev, KEY_UP,    dpad_up);
-    input_report_key(in_dev, KEY_DOWN,  dpad_down);
-    input_report_key(in_dev, KEY_KPPLUS, btn_plus);
-    input_report_key(in_dev, KEY_KPMINUS, btn_minus);
-    input_report_key(in_dev, KEY_HOME,  btn_home);
-    input_report_key(in_dev, KEY_A,     btn_A);
-    input_report_key(in_dev, KEY_B,     btn_B);
-    input_report_key(in_dev, KEY_1,     btn_1);
-    input_report_key(in_dev, KEY_2,     btn_2);
-    input_sync(in_dev);
+    if (len == 0)
+        len = snprintf(mapping_output, sizeof(mapping_output), "No buttons pressed");
 
+    if (len < sizeof(mapping_output) - 1) {
+        mapping_output[len++] = '\n';
+        mapping_output[len] = '\0';
+    }
+
+    circ_buffer_write(mapping_output, len);
+}
+
+/* Character device file operations */
+static int device_open(struct inode *inode, struct file *file)
+{
     return 0;
 }
 
+static int device_release(struct inode *inode, struct file *file)
+{
+    return 0;
+}
+
+static ssize_t device_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+    size_t bytes_copied = 0;
+
+    mutex_lock(&circ_mutex);
+    while (bytes_copied < count && tail != head) {
+        if (copy_to_user(buf + bytes_copied, &circ_buffer[tail], 1)) {
+            mutex_unlock(&circ_mutex);
+            return -EFAULT;
+        }
+        tail = (tail + 1) % CIRC_BUFFER_SIZE;
+        bytes_copied++;
+    }
+    mutex_unlock(&circ_mutex);
+    return bytes_copied;
+}
+
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    int ret = 0;
+    switch (cmd) {
+    case WIIMOTE_IOCTL_REQUEST_STATUS:
+        if (wii_hid_dev) {
+            u8 status_request[2] = { 0x15, 0x00 };
+            printk(KERN_INFO "Sending battery status request (output report 0x15)\n");
+            ret = hid_hw_raw_request(wii_hid_dev,
+                                     status_request[0],
+                                     status_request,
+                                     sizeof(status_request),
+                                     HID_OUTPUT_REPORT,
+                                     HID_REQ_SET_REPORT);
+            printk(KERN_INFO "Battery status request returned: %d\n", ret);
+            if (ret < 0)
+                printk(KERN_ERR DRIVER_NAME ": failed to send status request, error %d\n", ret);
+        } else {
+            printk(KERN_ERR DRIVER_NAME ": HID device not available for status request\n");
+            ret = -ENODEV;
+        }
+        break;
+    default:
+        ret = -ENOTTY;
+    }
+    return ret;
+}
+
+static struct file_operations fops = {
+    .owner          = THIS_MODULE,
+    .open           = device_open,
+    .release        = device_release,
+    .read           = device_read,
+    .unlocked_ioctl = device_ioctl,
+};
+
+
+static int wii_proc_show(struct seq_file *m, void *v)
+{
+    seq_printf(m, "Wii Remote Driver State:\n");
+    seq_printf(m, "  Connected: %s\n", wii_connected ? "Yes" : "No");
+    seq_printf(m, "  Last Battery: %d\n", wii_last_battery);
+    return 0;
+}
+
+static int wii_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, wii_proc_show, NULL);
+}
+
+
+static const struct proc_ops wii_proc_ops = {
+    .proc_open    = wii_proc_open,
+    .proc_read    = seq_read,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+};
+
+/* Character device variables */
+static int major;
+static struct class *wii_class;
+static struct cdev wii_cdev;
+
 /*
- * Probe function: called when a device matching our ID table is connected.
- * Initializes the device, allocates an input device, and starts the HID hardware.
+ * wii_raw_event - HID raw event callback.
+ *
+ * When a new HID report is received from the Wii remote, this callback is invoked.
+ * otherwise, we perform input mapping.
  */
+static int wii_raw_event(struct hid_device *hdev, struct hid_report *report, u8 *data, int size)
+{
+    int i;
+    printk(KERN_INFO "wii_raw_event: received report: ");
+    for (i = 0; i < size; i++)
+        printk(KERN_CONT "%02x ", data[i]);
+    printk(KERN_CONT "\n");
+
+    if (size > 0 && data[0] == 0x20) {
+        printk(KERN_INFO "Battery status report detected.\n");
+        if (size >= 2) {
+            char battery_output[64];
+            int len = snprintf(battery_output, sizeof(battery_output), "Battery: %d\n", data[1]);
+            /* Cache the battery level */
+            wii_last_battery = data[1];
+            circ_buffer_write(battery_output, len);
+        }
+    } else {
+        perform_input_mapping(data, size);
+    }
+    return 0;
+}
+
+/* HID probe: called when a matching device is connected */
 static int wii_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
     int ret;
-    struct wii_data *wii;
 
     ret = hid_parse(hdev);
-    if (ret) {
-        hid_err(hdev, "Failed to parse HID reports\n");
+    if (ret)
         return ret;
-    }
 
     ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
-    if (ret) {
-        hid_err(hdev, "Failed to start HID device\n");
+    if (ret)
         return ret;
-    }
 
-    wii = devm_kzalloc(&hdev->dev, sizeof(*wii), GFP_KERNEL);
-    if (!wii)
-        return -ENOMEM;
-
-    /* Allocate a new input device for the Wii Remote */
-    wii->input = devm_input_allocate_device(&hdev->dev);
-    if (!wii->input)
-        return -ENOMEM;
-
-    /* Set a name and id for the input device */
-    wii->input->name = "Wii Remote";
-    wii->input->id.bustype = hdev->bus;
-    wii->input->id.vendor  = hdev->vendor;
-    wii->input->id.product = hdev->product;
-    wii->input->id.version = hdev->version;
-
-    /* Declare that this device can generate key events */
-    __set_bit(EV_KEY, wii->input->evbit);
-    __set_bit(KEY_RIGHT, wii->input->keybit);
-    __set_bit(KEY_LEFT,  wii->input->keybit);
-    __set_bit(KEY_UP,    wii->input->keybit);
-    __set_bit(KEY_DOWN,  wii->input->keybit);
-    __set_bit(KEY_KPPLUS, wii->input->keybit);
-    __set_bit(KEY_KPMINUS, wii->input->keybit);
-    __set_bit(KEY_HOME,  wii->input->keybit);
-    __set_bit(KEY_A,     wii->input->keybit);
-    __set_bit(KEY_B,     wii->input->keybit);
-    __set_bit(KEY_1,     wii->input->keybit);
-    __set_bit(KEY_2,     wii->input->keybit);
-
-    ret = input_register_device(wii->input);
-    if (ret) {
-        hid_err(hdev, "Failed to register input device\n");
-        return ret;
-    }
-
-    /* Save our driver data pointer */
-    hid_set_drvdata(hdev, wii);
-
-    printk(KERN_INFO "Wii Remote driver probed successfully\n");
+    wii_hid_dev = hdev;
+    wii_connected = 1;
+    printk(KERN_INFO DRIVER_NAME ": Wii remote connected\n");
     return 0;
 }
 
-/*
- * Remove function: called when the device is disconnected or the module is unloaded.
- * Cleans up the hardware state.
- */
+/* HID remove: called when the device is disconnected */
 static void wii_remove(struct hid_device *hdev)
 {
-    hid_hw_stop(hdev);
-    printk(KERN_INFO "Wii Remote driver removed\n");
+    wii_hid_dev = NULL;
+    wii_connected = 0;
+    printk(KERN_INFO DRIVER_NAME ": Wii remote disconnected\n");
 }
 
-/*
- * Device ID table: lists the devices supported by this driver.
- * Here we use BUS_BLUETOOTH and supply vendor, product, and version=0.
+/* HID device ID table for the Wii remote.
+ * Updated for current kernels with four arguments.
  */
-static const struct hid_device_id wii_ids[] = {
-    { HID_DEVICE(BUS_BLUETOOTH, WIIMOTE_VENDOR_ID, WIIMOTE_PRODUCT_ID, 0) },
+static const struct hid_device_id wii_remote_devices[] = {
+    { HID_DEVICE(BUS_BLUETOOTH, 0x057e, 0x0306, 0) },
     { }
 };
-MODULE_DEVICE_TABLE(hid, wii_ids);
+MODULE_DEVICE_TABLE(hid, wii_remote_devices);
 
-/*
- * HID driver structure: ties together the probe, remove, ID table, and raw event callback.
- * We set .raw_event to our custom callback to intercept raw HID reports.
- */
+/* HID driver structure */
 static struct hid_driver wii_driver = {
-    .name      = "wii_remote",
-    .id_table  = wii_ids,
-    .probe     = wii_probe,
-    .remove    = wii_remove,
-    .raw_event = wii_parse_report,
+    .name       = DRIVER_NAME,
+    .id_table   = wii_remote_devices,
+    .probe      = wii_probe,
+    .remove     = wii_remove,
+    .raw_event  = wii_raw_event,
 };
 
-module_hid_driver(wii_driver);
+static int __init wii_init(void)
+{
+    int ret;
+    dev_t dev;
+
+
+    wii_proc_entry = proc_create("wii_remote", 0, NULL, &wii_proc_ops);
+    if (!wii_proc_entry) {
+        printk(KERN_ERR DRIVER_NAME ": failed to create /proc/wii_remote\n");
+        return -ENOMEM;
+    }
+
+    /* Allocate a character device region */
+    ret = alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME);
+    if (ret < 0) {
+        printk(KERN_ERR DRIVER_NAME ": failed to allocate char device region\n");
+        return ret;
+    }
+    major = MAJOR(dev);
+
+    /* Initialize and add the character device */
+    cdev_init(&wii_cdev, &fops);
+    ret = cdev_add(&wii_cdev, dev, 1);
+    if (ret < 0) {
+        unregister_chrdev_region(dev, 1);
+        printk(KERN_ERR DRIVER_NAME ": failed to add cdev\n");
+        return ret;
+    }
+
+    /* Create a device class and file in /dev */
+    wii_class = class_create(DEVICE_NAME);
+    if (IS_ERR(wii_class)) {
+        cdev_del(&wii_cdev);
+        unregister_chrdev_region(dev, 1);
+        printk(KERN_ERR DRIVER_NAME ": failed to create class\n");
+        return PTR_ERR(wii_class);
+    }
+    device_create(wii_class, NULL, dev, NULL, DEVICE_NAME);
+
+    /* Register the HID driver */
+    ret = hid_register_driver(&wii_driver);
+    if (ret) {
+        device_destroy(wii_class, dev);
+        class_destroy(wii_class);
+        cdev_del(&wii_cdev);
+        unregister_chrdev_region(dev, 1);
+        printk(KERN_ERR DRIVER_NAME ": failed to register HID driver\n");
+        return ret;
+    }
+
+    printk(KERN_INFO DRIVER_NAME ": driver loaded (major %d)\n", major);
+    return 0;
+}
+
+static void __exit wii_exit(void)
+{
+    dev_t dev = MKDEV(major, 0);
+
+    if (wii_proc_entry) {
+        remove_proc_entry("wii_remote", NULL);
+        wii_proc_entry = NULL;
+    }
+
+    hid_unregister_driver(&wii_driver);
+    device_destroy(wii_class, dev);
+    class_destroy(wii_class);
+    cdev_del(&wii_cdev);
+    unregister_chrdev_region(dev, 1);
+
+    printk(KERN_INFO DRIVER_NAME ": driver unloaded\n");
+}
+
+module_init(wii_init);
+module_exit(wii_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("Skeleton Wii Remote driver for reading basic inputs");
-
+MODULE_AUTHOR("Ryan, Ciaran and Peter ");
+MODULE_DESCRIPTION("");
